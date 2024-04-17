@@ -1,0 +1,740 @@
+---
+title: "1361ProjectFinalCopy"
+author: "Owen Smith"
+date: "2024-04-14"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(caret)
+library(MASS)
+library(naivebayes)
+library(klaR)
+library(glmnet)
+library(pls)
+library(leaps)
+library(splines)
+library(mgcv)
+library(tree)
+library(randomForest)
+library(gbm)
+library(BART)
+
+```
+
+EDA
+
+```{r}
+
+test <- read.csv("test.csv")
+train <- read.csv("train.csv")
+
+modelMSEs <- vector()
+
+head(test); head(train) 
+
+summary(train[, 4:18]) #summary stats
+
+```
+
+```{r}
+
+ggplot(train, aes(x = popularity)) + geom_boxplot(color = "darkblue") #popularity visualization 
+
+```
+
+```{r}
+
+list <- c(5, 7:17)  #access numeric p
+list.inf <- c(7:9, 11:16)
+
+par(mfrow = c(1,3))
+boxplot(train[, list.inf]) #numerous outliers among spechiness, instrumentals, and liveness
+boxplot(train$loudness, main = "Loudness") #more outliers
+boxplot(train$duration_ms, main = "Duration") #more outliers
+
+z.scores <- scale(train[, c(5, 10, 12, 14, 15)]) #scale and remove outliers from training set
+outliers <- rowSums(abs(z.scores) > 2) > 0
+train.cleaned <- train[!outliers, ]
+dim(train); dim(train.cleaned) #compare dims || 250 removed observations
+
+#transform variables
+
+train.cleaned$explicit = as.integer(train.cleaned$explicit)
+train.cleaned <- cbind(train.cleaned, model.matrix(~ track_genre - 1, data = train.cleaned))
+train.cleaned <- train.cleaned[, -which(names(train.cleaned) == "track_genre")]
+
+```
+
+```{r}
+par(mfrow = c(3,4))
+for (i in list) {
+  hist(train[, i], col = 'skyblue', main = paste("Hist of", colnames(train)[i])) #p distribution visualization 
+}
+
+```
+
+```{r}
+
+ggplot(train, aes(x = popularity, y = track_genre)) + geom_boxplot(color = 'darkblue') #popularity across genre groups
+
+```
+
+```{r}
+
+ggplot(train, aes(x = popularity, y = explicit)) + geom_boxplot(color = 'darkblue') #popularity among explicit vs non-explicit 
+
+table(train$explicit) #n for each group
+
+```
+```{r}
+
+list2 <- c(5, 7:10, 12:18)
+par(mfrow = c(3, 4))
+
+#scatter plot for numerical predictors
+for (i in list2) {
+  plot(train[, i], train$popularity, xlab = colnames(train)[i], ylab = "Pop") #nothing too telling here 
+}
+
+cor(train[, list2], train$popularity) #^^ cor with popularity
+
+```
+
+```{r}
+
+#addressing collinearity  
+
+cor.matrix <- cor(train[, list2])
+high.cor <- which(abs(cor.matrix) > .6 & cor.matrix != 1, arr.ind = TRUE)
+
+#cor.matrix[5,3] #loud + energy | pos | combine?
+#cor.matrix[8,3] #acou + energy | neg
+#cor.matrix[8,5] #acou + loud | neg
+
+par(mfrow = c(3, 1))
+
+plot(train$loudness, train$energy)
+plot(train$acousticness, train$energy)
+plot(train$loudness, train$acousticness)
+
+```
+
+```{r}
+
+any(is.na(train.cleaned))
+
+sum(train$popularity == 0) / 1200
+
+table(train$track_genre)
+
+aggregate(popularity ~ track_genre, data = train, FUN = mean)
+
+```
+
+```{r}
+
+#Linear model
+
+lin.data <- train.cleaned[, 4:21]
+
+lin.mod <- lm(popularity ~ ., data = lin.data); summary(lin.mod) #duration, pop, valence only significant 
+#lin.mod2 <- lm(popularity ~ . - id - album_name - track_name, data = train); summary(lin.mod2) #with outliers included, duration is less important
+
+mse_bootstrap <- numeric(1000)
+
+#Bootstrap for MSE
+
+for (i in 1:1000) {
+    indices <- sample(nrow(lin.data), replace = TRUE)
+    bootstrap_sample <- lin.data[indices, ]
+    lin.mod <- lm(popularity ~ . , data = bootstrap_sample)
+    
+    predicted_values <- predict(lin.mod, newdata = lin.data)
+    
+    mse_bootstrap[i] <- mean((predicted_values - lin.data$popularity)^2)
+}
+
+mean(mse_bootstrap)
+sd(mse_bootstrap)
+AIC(lin.mod)
+BIC(lin.mod)
+
+```
+
+```{r}
+
+#GLM 
+
+X <- lin.data[, -1]
+Y <- lin.data$popularity
+
+ctrl <- trainControl(method = "cv", number = 5, verboseIter = TRUE)
+
+glm.mod <- train(x = X, y = Y, method = "glm", trControl = ctrl, family = gaussian(link = "identity"))
+glm.mod2 <- glm(popularity ~ ., data = lin.data, family = gaussian(link = "identity"))
+
+
+n_bootstrap <- 1000
+mse_bootstrap <- numeric(n_bootstrap)
+
+#Bootstrap
+
+for (i in 1:n_bootstrap) {
+    bootstrap_indices <- sample(nrow(lin.data), replace = TRUE)
+    bootstrap_data <- lin.data[bootstrap_indices, ]
+    
+    glm_model_bootstrap <- glm(popularity ~ ., data = bootstrap_data, family = gaussian(link = "identity"))
+    
+    predicted_values <- predict(glm_model_bootstrap, newdata = lin.data)
+    
+    mse_bootstrap[i] <- mean((predicted_values - lin.data$popularity)^2)
+}
+
+mean(mse_bootstrap)
+sd(mse_bootstrap)
+AIC(glm.mod2)
+BIC(glm.mod2)
+
+```
+
+```{r}
+
+#Permutation testing for variable importance
+
+model <- lm(popularity ~ ., data = lin.data)
+
+original_aic <- AIC(model)
+original_bic <- BIC(model)
+
+
+permutation_importance <- numeric(ncol(lin.data)-1)  
+
+for (i in 2:ncol(lin.data)) {
+  permuted_data <- lin.data
+  permuted_data[, i] <- sample(permuted_data[, i])  
+  
+  permuted_model <- lm(popularity ~ ., data = permuted_data)
+  
+  permuted_aic <- AIC(permuted_model)
+  permuted_bic <- BIC(permuted_model)
+  
+  permutation_importance[i - 3] <- original_aic - permuted_aic
+  permutation_importance[i - 3] <- original_bic - permuted_bic
+}
+
+variable_names <- names(lin.data)[2:ncol(lin.data)]
+sorted_importance <- sort(permutation_importance, decreasing = TRUE)
+sorted_variables <- variable_names[order(permutation_importance, decreasing = TRUE)]
+
+for (i in 1:length(sorted_variables)) {
+  print(paste("Variable:", sorted_variables[i], "- Permutation Importance:", sorted_importance[i]))
+}
+
+#seems as if tempo is the most important predictor 
+
+
+```
+
+```{r}
+
+#Create validation set
+
+index <- sample(1:nrow(lin.data), .7 * nrow(lin.data))
+train4test <- lin.data[index, ]
+validation <- lin.data[-index, ]
+
+#FSS + BSS
+
+initial_model <- lm(popularity ~ ., data = train4test)
+
+# FSS
+forward_model <- step(initial_model, direction = "forward", scope = formula(~1), trace = 0)
+forward.pred <- predict(forward_model, newdata = validation)
+FSS.err <- mean((forward.pred - validation$popularity)^2)
+modelMSEs <- c(modelMSEs, FSS.err)
+summary(forward_model)
+
+# BSS
+backward_model <- step(initial_model, direction = "backward", trace = 0)
+back.pred <- predict(backward_model, newdata = validation)
+BSS.err <- mean((back.pred - validation$popularity)^2)
+modelMSEs <- c(modelMSEs, BSS.err)
+summary(backward_model)
+
+
+```
+
+```{r}
+
+#Re-assess linear and GLM model
+
+lin.mod2 <- lm(popularity ~ ., data = train4test); summary(lin.mod2)
+pred.lin <- predict(lin.mod2, newdata = validation)
+lin.err <- mean((pred.lin - validation$popularity)^2)
+modelMSEs <- c(modelMSEs, lin.err)
+
+glm3 <- glm(popularity ~ ., data = train4test, family = gaussian(link = "identity")); summary(glm3)
+glm3.pred <- predict(glm3, newdata = validation)
+glm.err <- mean((glm3.pred - validation$popularity)^2)
+modelMSEs <- c(modelMSEs, glm.err)
+
+```
+
+```{r, warning = FALSE}
+
+#Ridge + lasso
+
+x <- as.matrix(train4test[, -1])
+y <- train4test$popularity
+
+ridge.cv <- cv.glmnet(x, y, alpha = 0)
+lasso.cv <- cv.glmnet(x, y, alpha = 1)
+
+par(mfrow = c(1, 2))
+plot(ridge.cv); plot(lasso.cv)
+
+x.test <- as.matrix(validation[, -1])
+y.test <- validation$popularity
+
+ridge.mod <- glmnet(x, y, alpha = 0)
+#coef(ridge.mod)
+ridge.pred <- predict(ridge.mod, newx = x.test)
+ridge.err <- mean((ridge.pred - y.test)^2)
+modelMSEs <- c(modelMSEs, ridge.err)
+
+lasso.mod <- glmnet(x, y, alpha = 1)
+#lasso.coef <- coef(lasso.mod)
+lasso.pred <- predict(lasso.mod, newx = x.test)
+lasso.err <- mean((lasso.pred - y.test)^2)
+modelMSEs <- c(modelMSEs, lasso.err)
+
+```
+
+```{r}
+
+#PCR + PLS
+
+x <- as.matrix(train4test[, -1])
+y <- train4test$popularity
+
+
+pcr.mod <- pcr(popularity ~ ., data = train4test, scale = TRUE, validation = "CV")
+summary(pcr.mod)
+pcr.pred <- predict(pcr.mod, newdata = validation)
+pcr.err <- mean((pcr.pred - validation$popularity)^2) #10 comps ??
+modelMSEs <- c(modelMSEs, pcr.err)
+
+pls.mod <- plsr(popularity ~ ., data = train4test, scale = TRUE, validaiton = "CV")
+summary(pls.mod)
+pls.pred <- predict(pls.mod, newdata = validation)
+pls.err <- mean((pls.pred - validation$popularity)^2)
+modelMSEs <- c(modelMSEs, pls.err)
+
+#final.pls <- plsr(popularity ~ ., data = train4test, scale = TRUE, ncomp = 10)
+#pls.final.pred <- predict(final.pls, newdata = validation)
+#mean((pls.final.pred - validation$popularity)^2)
+
+```
+
+```{r}
+
+#Cubic, spline, smoothing
+
+list.whatever <- c(2, 4:5, 7, 9:14)
+
+for (i in list.whatever) {
+  colname <- colnames(train4test)[i]
+  
+  poly.mod <- lm(popularity ~ poly(train4test[, i], 3), data = train4test)
+  
+  spline.mod <- lm(popularity ~ bs(train4test[, i], df = 5), data = train4test)
+  
+  smooth.mod <- smooth.spline(train4test[, i], train4test$popularity)
+  
+  p <- ggplot(train4test, aes_string(x = colname, y = "popularity")) +
+    geom_point() +
+    geom_line(aes(y = predict(poly.mod)), color = "red") +
+    geom_line(aes(y = predict(spline.mod)), color = 'blue') +
+    geom_line(aes(y = fitted(smooth.mod)), color = 'green') +
+    labs(title = paste("Regression with", colname),
+         x = colname,
+         y = "Popularity") +
+    theme_minimal()
+  
+  print(p)
+}
+
+```
+
+```{r}
+#GAM
+
+gam.mod <- gam(popularity ~ s(duration_ms) + s(danceability) + s(energy) + s(loudness) + s(key) + s(speechiness) + s(acousticness) + s(instrumentalness) + s(liveness) + s(valence) + s(tempo), data = train4test); summary(gam.mod)
+
+gam.pred <- predict(gam.mod, newdata = validation)
+gam.err <- mean((gam.pred - validation$popularity)^2)
+modelMSEs <- c(modelMSEs, gam.err)
+
+```
+
+```{r, warning = FALSE}
+
+#Tree
+
+tree.mod <- tree(popularity ~ ., data = train4test)
+tree.pred <- predict(tree.mod, newdata = validation)
+tree.err <- mean((tree.pred - validation$popularity)^2)
+modelMSEs <- c(modelMSEs, tree.err)
+
+cv_tree <- cv.tree(tree.mod)
+prune_tree <- prune.tree(tree.mod, best = cv_tree$size[which.min(cv_tree$dev)])
+prune.pred <- predict(prune_tree, newdata = validation)
+prune.err <- mean((prune.pred - validation$popularity)^2)
+modelMSEs <- c(modelMSEs, prune.err)
+
+```
+
+```{r}
+
+#Bagging and RF
+
+bag.mod <- randomForest(popularity ~ ., data = train4test, mtry = ncol(train4test)-1, ntree = 500)
+bag.pred <- predict(bag.mod, newdata = validation)
+bag.err <- mean((bag.pred - validation$popularity)^2)
+modelMSEs <- c(modelMSEs, bag.err)
+#importance(bag.mod)
+
+ntree_values <- seq(100, 1500, by = 100)
+mtry_values <- 1:10
+
+best_m <- NULL
+best_ntree <- NULL
+best_mse <- Inf
+
+for (ntree in ntree_values) {
+  for (mtry in mtry_values) {
+
+    rf_model <- randomForest(popularity ~ ., data = train4test, ntree = ntree, mtry = mtry)
+    
+    rf_predictions <- predict(rf_model, newdata = validation)
+
+    rf_test_mse <- mean((rf_predictions - validation$popularity)^2) 
+    
+    cat("ntree =", ntree, "mtry =", mtry, "Test MSE =", rf_test_mse, "\n")
+    
+    if (rf_test_mse < best_mse) {
+      best_m <- mtry
+      best_ntree <- ntree
+      best_mse <- rf_test_mse
+    }
+  }
+}
+
+cat("Best mtry:", best_m, "\n")
+cat("Best ntree:", best_ntree, "\n")
+cat("Best Test MSE:", best_mse, "\n")
+
+```
+
+```{r}
+
+#GBM
+set.seed(134)
+
+shrinkage_values <- seq(0, 0.2, by = 0.01)
+test_mse <- vector()
+
+for (shrinkage in shrinkage_values) {
+    gbm_model <- gbm(popularity ~ ., data = train4test, distribution = "gaussian", n.trees = 1000, 
+                     shrinkage = shrinkage, interaction.depth = 1)  # Assuming interaction depth is 1 for now
+    
+    predicted_values <- predict(gbm_model, newdata = validation)
+    
+    mse <- mean((predicted_values - validation$popularity)^2)
+    test_mse <- c(test_mse, mse)
+    
+    print(length(test_mse))
+    
+    if (length(test_mse) == 21) {
+      break
+    }
+}
+
+plot(shrinkage_values, test_mse[1:21], type = "b", xlab = "Shrinkage", ylab = "Test MSE",
+     main = "Test MSE vs. Shrinkage for GBM with Interaction Depth 1") #.06
+
+##########################################################################
+
+best_mse <- Inf
+best_shrinkage <- NULL
+best_interaction_depth <- NULL
+
+interaction_depth_values <- c(1:15)
+
+for (shrinkage in shrinkage_values) {
+  for (depth in interaction_depth_values) {  # Define interaction_depth_values
+    gbm_model <- gbm(popularity ~ ., data = train4test, distribution = "gaussian", 
+                     n.trees = 1000, shrinkage = shrinkage, interaction.depth = depth)
+    
+    predicted_values <- predict(gbm_model, newdata = validation)
+    
+    mse <- mean((predicted_values - validation$popularity)^2)
+    
+    if (mse < best_mse) {
+      best_mse <- mse
+      best_shrinkage <- shrinkage
+      best_interaction_depth <- depth
+    }
+  }
+}
+
+cat("Best Shrinkage:", best_shrinkage, "\n")
+cat("Best Interaction Depth:", best_interaction_depth, "\n") #.01 and 5 || .01 and 11
+best_mse
+
+ntree.vals <- seq(100, 2500, by = 100)
+treeMseS <- vector()
+
+for (ntree in ntree.vals) {
+  tree.tune <- gbm(popularity ~ ., data = train4test, distribution = "gaussian", 
+                   n.tree = ntree, shrinkage = .01, interaction.depth = 13)
+  tree.pred <- predict(tree.tune, newdata = validation)
+  treeMse <- mean((tree.pred - validation$popularity)^2)
+  treeMseS <- c(treeMseS, treeMse)
+}
+
+plot(ntree.vals, treeMseS[1:25])
+
+gbm.best <- gbm(popularity ~ ., data = train4test, distribution = "gaussian", 
+                n.trees = 800, shrinkage = .01, interaction.depth = 13)
+gbm.best.pred <- predict(gbm.best, newdata = validation)
+gmb.err <- mean((gbm.best.pred - validation$popularity)^2)
+modelMSEs <- c(modelMSEs, gmb.err)
+
+```
+
+```{r}
+
+#GBART
+set.seed(171)
+
+xtrain <- train4test[, -1]
+ytrain <- train4test$popularity
+xtest <- validation[, -1]
+
+#gbart <- gbart(xtrain, ytrain, x.test = xtest)
+#yhat.bart <- gbart$yhat.test.mean
+#mean((validation$popularity - yhat.bart)^2)
+
+#ord <- order(gbart$varcount.mean, decreasing = T)
+#gbart$varcount.mean[ord]
+
+
+m_values <- seq(0, 200, by = 25)
+performance <- vector()
+
+for (i in seq_along(m_values)) {
+    m <- m_values[i]
+    
+    bart_model <- gbart(xtrain, ytrain, x.test = xtest, m = m)
+    
+    yhat <- bart_model$yhat.test.mean
+    
+    performance[i] <- mean((validation$popularity - yhat)^2)
+}
+
+best_index <- which.min(performance)
+
+cat("Best value of m:", m_values[best_index], "\n")
+cat("Corresponding performance:", performance[best_index], "\n")
+plot(m_values, performance)
+
+
+ntree_values <- seq(100, 1000, by = 100)
+test_mse <- vector()
+
+for (ntree in ntree_values) {
+  gbart_model <- gbart(xtrain, ytrain, x.test = xtest, ntree = ntree)
+  
+  predicted_values <- gbart_model$yhat.test.mean
+
+  mse <- mean((predicted_values - validation$popularity)^2)
+  test_mse <- c(test_mse, mse)
+}
+
+plot(ntree_values, test_mse[1:10], type = "b", xlab = "Number of Trees", ylab = "Test MSE",
+     main = "Test MSE vs. Number of Trees for GBART") 
+
+
+k_values <- c(1:20)
+test_mse_k <- vector()
+
+for (i in k_values) {
+    gbart_model <- gbart(xtrain, ytrain, x.test = xtest, k = i)
+    
+    predicted_values <- gbart_model$yhat.test.mean
+    
+    mse <- mean((predicted_values - validation$popularity)^2)
+    test_mse_k[i] <- mse
+}
+
+plot(k_values, test_mse_k)
+
+gbart.final <- gbart(xtrain, ytrain, x.test = xtest, k = 1, m = 125, ntree = 200)
+pred.gbart <- gbart.final$yhat.test.mean
+gbart.err <- mean((pred.gbart - validation$popularity)^2)
+modelMSEs <- c(modelMSEs, gbart.err)
+
+```
+```{r}
+
+#Lasso + Ridge again
+
+x <- as.matrix(train4test[, -1])
+y <- train4test$popularity
+
+x.test <- as.matrix(validation[, -1])
+y.test <- validation$popularity
+
+lambda_values <- 10^seq(10, -2, length = 100)
+grid <- expand.grid(alpha = 1, lambda = lambda_values)
+ctrl <- trainControl(method = "cv", number = 10)  
+
+ridge_model <- train(x = x, y = y,
+                     method = "glmnet",
+                     trControl = ctrl,
+                     tuneGrid = grid,
+                     preProcess = c("center", "scale"),
+                     tuneLength = 10)  
+
+best_lambda <- ridge_model$bestTune$lambda
+
+
+final_ridge_model <- glmnet(x = x,  
+                            y = y,
+                            alpha = 0,  
+                            lambda = best_lambda)
+
+
+final_ridge_pred <- predict(final_ridge_model, newx = x.test)
+
+ridge.err2 <- mean((final_ridge_pred - y.test)^2)
+modelMSEs <- c(modelMSEs, ridge.err2)
+
+
+grid2 <- expand.grid(alpha = 1, lambda = lambda_values)
+
+lasso_model <- train(x, y,
+                     method = "glmnet",
+                     trControl = ctrl,
+                     tuneGrid = grid2,
+                     preProcess = c("center", "scale"),
+                     tuneLength = 10)  
+
+best_lambda <- lasso_model$bestTune$lambda
+
+final_lasso_model <- glmnet(x = x,
+                            y = y,
+                            alpha = 1,  
+                            lambda = best_lambda)
+
+final_lasso_pred <- predict(final_lasso_model, newx = x.test)
+
+lasso.err2 <- mean((final_lasso_pred - y.test)^2)
+modelMSEs <- c(modelMSEs, lasso.err2)
+
+```
+
+```{r}
+
+#RF again post feature engineering 
+
+train.cleaned$loud_energy_sum <- train.cleaned$loudness + train.cleaned$energy #FE
+train.cleaned$loud_energy_product <- train.cleaned$loudness * train.cleaned$energy #FE
+
+set.seed(123)
+train_indices <- sample(1:nrow(train.cleaned), 0.8 * nrow(train.cleaned))
+train_data <- train.cleaned[train_indices, ]
+validation_data <- train.cleaned[-train_indices, ]
+train_data <- train_data[, -c(1:3)]
+validation_data <- validation_data[, -c(1:3)]
+
+dim(train_data)
+dim(validation_data)
+
+#rf <- randomForest(popularity ~ ., data = train_data, mtry = 9, ntree = 200)
+#rf.pred <- predict(rf, newdata = validation_data)
+#mean((rf.pred - validation_data$popularity)^2)
+
+mtry_values <- c(1:20)
+ntree_values <- 100 #seq(100, 2000, by = 100) 
+
+best_mtry1 <- NULL
+best_ntree1 <- NULL
+best_mse1 <- Inf
+
+for (mtry in mtry_values) {
+  for (ntree in ntree_values) {
+
+    rf_model <- randomForest(popularity ~ ., data = train_data, mtry = mtry, ntree = ntree)
+    
+    rf_pred <- predict(rf_model, newdata = validation_data)
+    
+    mse <- mean((rf_pred - validation_data$popularity)^2)
+    
+    if (mse < best_mse1) {
+      best_mse1 <- mse
+      best_mtry1 <- mtry
+      best_ntree1 <- ntree
+    }
+  }
+}
+
+cat("Best mtry:", best_mtry1, "\n")
+cat("Best ntree:", best_ntree1, "\n")
+cat("Best MSE:", best_mse1, "\n")
+
+#final rf mtry = 8, ntree = 100
+
+bestRF <- randomForest(popularity ~ ., data = train_data, mtry = 18, ntree = 100)
+best.pred <- predict(bestRF, newdata = validation_data)
+rf.err <- mean((best.pred - validation_data$popularity)^2)
+modelMSEs <- c(modelMSEs, rf.err)
+importance(bestRF)
+
+```
+
+
+```{r}
+
+final.data <- train.cleaned[, -c(1:3)]
+
+#alter test set for predict
+test$explicit = as.integer(test$explicit)
+test <- cbind(test, model.matrix(~ track_genre - 1, data = test))
+test <- test[, -which(names(test) == "track_genre")]
+test$loud_energy_sum <- test$loudness + test$energy #FE
+test$loud_energy_product <- test$loudness * test$energy #FE
+
+FinalRF <- randomForest(popularity ~ ., data = final.data, mtry = best_mtry1, ntree = best_ntree1)
+FinalPred <- predict(FinalRF, newdata = test)
+
+FinalPredictions <- data.frame(id = test$id, popularity = FinalPred)
+
+filename <- "testing_predictions_Smith_Owen_ONS8.csv"  
+write.csv(FinalPredictions, file = filename, row.names = FALSE)
+
+Model = c("FSS", "BSS", "Linear", "GLM", "Ridge", "Lasso", "PCR", "PLS", "GAM", "Tree", "Pruned Tree", "Bagging", "GBM", "GBART", "Ridge2", "Lasso2", "RandomForest")
+
+model.results <- data.frame(
+  Model = Model, 
+  MSE = modelMSEs)
+
+
+```
